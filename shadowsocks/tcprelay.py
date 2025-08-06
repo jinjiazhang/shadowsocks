@@ -392,6 +392,14 @@ class TCPRelayHandler(object):
                                        self._handle_dns_resolved)
 
     def _create_remote_socket(self, ip, port):
+        proxy_host = common.to_str(self._config.get('proxy_host'))
+        proxy_port = self._config.get('proxy_port')
+        via_proxy_ports = self._config.get('via_proxy_ports')
+        if not self._is_local and proxy_host and proxy_port:
+            server_port = self._config.get('server_port')
+            if via_proxy_ports and server_port in via_proxy_ports:
+                return self._create_remote_socket_via_socks5_proxy(proxy_host, proxy_port, ip, port)
+            
         addrs = socket.getaddrinfo(ip, port, 0, socket.SOCK_STREAM,
                                    socket.SOL_TCP)
         if len(addrs) == 0:
@@ -407,6 +415,94 @@ class TCPRelayHandler(object):
         remote_sock.setblocking(False)
         remote_sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
         return remote_sock
+    
+    def _create_remote_socket_via_socks5_proxy(self, proxy_host, proxy_port, ip, port):
+         # Step 1: Create a blocking socket to connect to the proxy
+        try:
+            proxy_addrs = socket.getaddrinfo(proxy_host, proxy_port, 0, socket.SOCK_STREAM, socket.SOL_TCP)
+            if not proxy_addrs:
+                raise Exception("getaddrinfo failed for proxy %s:%d" % (proxy_host, proxy_port))
+            
+            af, socktype, proto, _, sa = proxy_addrs[0]
+            remote_sock = socket.socket(af, socktype, proto)
+            
+            # Set a timeout for blocking operations to prevent hanging forever
+            remote_sock.settimeout(10) 
+            
+            remote_sock.connect(sa)
+        except Exception as e:
+            logging.error("Failed to connect to SOCKS5 proxy: %s" % e)
+            raise
+
+        try:
+            # Step 2: SOCKS5 Greeting (blocking send/recv)
+            # VER=5, NMETHODS=1, METHOD=0 (NO AUTH)
+            remote_sock.sendall(b'\x05\x01\x00')
+            
+            # VER=5, METHOD=0 (NO AUTH)
+            resp = remote_sock.recv(2)
+            if len(resp) < 2 or resp[0] != 0x05 or resp[1] != 0x00:
+                raise Exception('SOCKS5 proxy greeting failed. Response: %r' % resp)
+
+            # Step 3: SOCKS5 Connection Request (blocking send/recv)
+            # Build the request packet
+            req = b'\x05\x01\x00'  # VER, CMD_CONNECT, RSV
+            
+            # Determine address type (ATYP)
+            try:
+                ip_bytes = socket.inet_pton(socket.AF_INET, common.to_str(ip))
+                req += b'\x01' + ip_bytes  # ATYP=1 (IPv4)
+            except OSError:
+                try:
+                    ip_bytes = socket.inet_pton(socket.AF_INET6, common.to_str(ip))
+                    req += b'\x04' + ip_bytes  # ATYP=4 (IPv6)
+                except OSError:
+                    # Assume it's a domain name
+                    ip_bytes = ip.encode('utf-8')
+                    req += b'\x03' + bytes([len(ip_bytes)]) + ip_bytes # ATYP=3 (Domain)
+
+            req += struct.pack('>H', port)
+            remote_sock.sendall(req)
+
+            # Step 4: Receive proxy response
+            # Read the first 4 bytes to get REP and ATYP
+            resp = remote_sock.recv(4)
+            if len(resp) < 4 or resp[0] != 0x05 or resp[1] != 0x00:
+                # REP != 0x00 means failure
+                err_code = resp[1] if len(resp) > 1 else -1
+                raise Exception('SOCKS5 proxy connect request failed. REP code: %d' % err_code)
+
+            # The connection is successful, consume the rest of the response
+            # to clear the buffer.
+            atyp = resp[3]
+            if atyp == 1: # IPv4
+                remote_sock.recv(4 + 2) # addr + port
+            elif atyp == 3: # Domain
+                domain_len_byte = remote_sock.recv(1)
+                if not domain_len_byte:
+                    raise Exception('SOCKS5 proxy response incomplete.')
+                remote_sock.recv(domain_len_byte[0] + 2) # domain + port
+            elif atyp == 4: # IPv6
+                remote_sock.recv(16 + 2) # addr + port
+
+            # Step 5: CRITICAL - Switch to non-blocking mode for the event loop
+            remote_sock.setblocking(False)
+            
+            # Set other socket options needed by the relay handler
+            remote_sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+
+            # Assign the socket to the handler
+            self._remote_sock = remote_sock
+            self._fd_to_handlers[remote_sock.fileno()] = self
+            
+            return remote_sock
+
+        except Exception as e:
+            remote_sock.close()
+            logging.error("SOCKS5 proxy handshake process failed: %s" % e)
+            if self._config['verbose']:
+                traceback.print_exc()
+            raise
 
     @shell.exception_handle(self_=True)
     def _handle_dns_resolved(self, result, error):
