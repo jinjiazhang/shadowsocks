@@ -417,91 +417,70 @@ class TCPRelayHandler(object):
         return remote_sock
     
     def _create_remote_socket_via_socks5_proxy(self, proxy_host, proxy_port, ip, port):
-         # Step 1: Create a blocking socket to connect to the proxy
+        remote_sock = None
+
+        def recv_exact(size):
+            chunks = []
+            remaining = size
+            while remaining:
+                chunk = remote_sock.recv(remaining)
+                if not chunk:
+                    raise IOError('SOCKS5 proxy response incomplete')
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b''.join(chunks)
+
         try:
-            proxy_addrs = socket.getaddrinfo(proxy_host, proxy_port, 0, socket.SOCK_STREAM, socket.SOL_TCP)
+            proxy_addrs = socket.getaddrinfo(
+                proxy_host, proxy_port, 0, socket.SOCK_STREAM, socket.SOL_TCP)
             if not proxy_addrs:
-                raise Exception("getaddrinfo failed for proxy %s:%d" % (proxy_host, proxy_port))
-            
+                raise IOError('getaddrinfo failed for SOCKS5 proxy')
             af, socktype, proto, _, sa = proxy_addrs[0]
             remote_sock = socket.socket(af, socktype, proto)
-            
-            # Set a timeout for blocking operations to prevent hanging forever
-            remote_sock.settimeout(10) 
-            
+            remote_sock.settimeout(10)
             remote_sock.connect(sa)
-        except Exception as e:
-            logging.error("Failed to connect to SOCKS5 proxy: %s" % e)
-            raise
-
-        try:
-            # Step 2: SOCKS5 Greeting (blocking send/recv)
-            # VER=5, NMETHODS=1, METHOD=0 (NO AUTH)
             remote_sock.sendall(b'\x05\x01\x00')
-            
-            # VER=5, METHOD=0 (NO AUTH)
-            resp = remote_sock.recv(2)
-            if len(resp) < 2 or resp[0] != 0x05 or resp[1] != 0x00:
-                raise Exception('SOCKS5 proxy greeting failed. Response: %r' % resp)
+            resp = recv_exact(2)
+            if resp != b'\x05\x00':
+                raise IOError('SOCKS5 proxy greeting failed. Response: %r' % resp)
 
-            # Step 3: SOCKS5 Connection Request (blocking send/recv)
-            # Build the request packet
-            req = b'\x05\x01\x00'  # VER, CMD_CONNECT, RSV
-            
-            # Determine address type (ATYP)
+            host = common.to_str(ip)
             try:
-                ip_bytes = socket.inet_pton(socket.AF_INET, common.to_str(ip))
-                req += b'\x01' + ip_bytes  # ATYP=1 (IPv4)
-            except OSError:
+                addr = b'\x01' + socket.inet_pton(socket.AF_INET, host)
+            except (socket.error, ValueError):
                 try:
-                    ip_bytes = socket.inet_pton(socket.AF_INET6, common.to_str(ip))
-                    req += b'\x04' + ip_bytes  # ATYP=4 (IPv6)
-                except OSError:
-                    # Assume it's a domain name
-                    ip_bytes = ip.encode('utf-8')
-                    req += b'\x03' + bytes([len(ip_bytes)]) + ip_bytes # ATYP=3 (Domain)
+                    addr = b'\x04' + socket.inet_pton(socket.AF_INET6, host)
+                except (socket.error, ValueError):
+                    host_bytes = common.to_bytes(ip)
+                    if not 1 <= len(host_bytes) <= 255:
+                        raise ValueError('Invalid SOCKS5 domain length')
+                    addr = b'\x03' + struct.pack('!B', len(host_bytes)) + host_bytes
+            remote_sock.sendall(b'\x05\x01\x00' + addr + struct.pack('!H', port))
+            version, reply, reserved, atyp = struct.unpack('!BBBB', recv_exact(4))
+            if version != 5 or reserved != 0:
+                raise IOError('Invalid SOCKS5 proxy response header')
+            if reply != 0:
+                raise IOError('SOCKS5 proxy connect request failed. REP code: %d' % reply)
+            if atyp == 1:
+                recv_exact(6)
+            elif atyp == 3:
+                length = struct.unpack('!B', recv_exact(1))[0]
+                recv_exact(length + 2)
+            elif atyp == 4:
+                recv_exact(18)
+            else:
+                raise IOError('Invalid SOCKS5 proxy response address type: %d' % atyp)
 
-            req += struct.pack('>H', port)
-            remote_sock.sendall(req)
-
-            # Step 4: Receive proxy response
-            # Read the first 4 bytes to get REP and ATYP
-            resp = remote_sock.recv(4)
-            if len(resp) < 4 or resp[0] != 0x05 or resp[1] != 0x00:
-                # REP != 0x00 means failure
-                err_code = resp[1] if len(resp) > 1 else -1
-                raise Exception('SOCKS5 proxy connect request failed. REP code: %d' % err_code)
-
-            # The connection is successful, consume the rest of the response
-            # to clear the buffer.
-            atyp = resp[3]
-            if atyp == 1: # IPv4
-                remote_sock.recv(4 + 2) # addr + port
-            elif atyp == 3: # Domain
-                domain_len_byte = remote_sock.recv(1)
-                if not domain_len_byte:
-                    raise Exception('SOCKS5 proxy response incomplete.')
-                remote_sock.recv(domain_len_byte[0] + 2) # domain + port
-            elif atyp == 4: # IPv6
-                remote_sock.recv(16 + 2) # addr + port
-
-            # Step 5: CRITICAL - Switch to non-blocking mode for the event loop
             remote_sock.setblocking(False)
-            
-            # Set other socket options needed by the relay handler
             remote_sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-
-            # Assign the socket to the handler
             self._remote_sock = remote_sock
             self._fd_to_handlers[remote_sock.fileno()] = self
-            
+            self._remote_connected_via_socks5 = True
             return remote_sock
-
         except Exception as e:
-            remote_sock.close()
-            logging.error("SOCKS5 proxy handshake process failed: %s" % e)
-            if self._config['verbose']:
-                traceback.print_exc()
+            if remote_sock is not None:
+                remote_sock.close()
+            logging.error('SOCKS5 proxy handshake process failed: %s', e)
             raise
 
     @shell.exception_handle(self_=True)
@@ -537,7 +516,8 @@ class TCPRelayHandler(object):
             remote_sock = self._create_remote_socket(remote_addr,
                                                      remote_port)
             try:
-                remote_sock.connect((remote_addr, remote_port))
+                if not getattr(self, '_remote_connected_via_socks5', False):
+                    remote_sock.connect((remote_addr, remote_port))
             except (OSError, IOError) as e:
                 if eventloop.errno_from_exception(e) == \
                         errno.EINPROGRESS:
